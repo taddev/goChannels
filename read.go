@@ -3,106 +3,97 @@ package main
 import (
 	//"fmt"
 	//"io/ioutil"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 var (
-	doneDir  string = "./data/done/"
-	newDir   string = "./data/new/"
-	workDir  string = "./data/work/"
-	errorDir string = "./data/error/"
+	doneDir  = "./data/done/"
+	newDir   = "./data/new/"
+	workDir  = "./data/work/"
+	errorDir = "./data/error/"
 )
 
-func worker(id int, jobs <-chan int, results chan<- int, jobsDone chan<- bool) {
+func worker(id int, jobs <-chan string, jobsDone *sync.WaitGroup) {
 	log.Println("Worker:", id, "starting up")
 
-	for j := range jobs {
-		log.Println("Worker:", id, "working on job", j)
-		time.Sleep(5 * time.Second)
-		results <- j * id
+	for {
+		file, more := <-jobs
+		if !more {
+			log.Println("Worker:", id, "jobs closed")
+			break
+		}
+
+		log.Println("Worker:", id, "working on", file)
+		os.Rename(newDir+file, workDir+file)
+		time.Sleep(2 * time.Second)
+
+		log.Println("Worker:", id, "reading", file)
+		cont, _ := ioutil.ReadFile(workDir + file)
+		time.Sleep(2 * time.Second)
+
+		if strings.Compare(strings.Trim(string(cont), "\n"), "error") == 0 {
+			log.Println("Worker:", id, "error reading", file)
+			os.Rename(workDir+file, errorDir+file)
+		} else {
+			log.Println("Worker:", id, "done with", file)
+			os.Rename(workDir+file, doneDir+file)
+		}
 	}
 
 	log.Println("Worker:", id, "shutting down")
-	jobsDone <- true
+	jobsDone.Done()
 }
 
-func jobGen(jobs chan<- int, stop <-chan bool, done chan<- bool) {
-	j := 1
+func jobGen(jobs chan<- string, done chan<- bool) {
+	// setup signal watcher
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
 	log.Println("Job generator started")
 	for {
-		jobs <- j
-		j++
+		files, _ := ioutil.ReadDir(newDir)
+		for _, file := range files {
+			jobs <- file.Name()
+		}
 
 		select {
-		case <-stop:
-			log.Println("Job generator got stop signal")
+		case <-signals:
+			log.Println("Directory watch got stop signal")
 			done <- true
 			return
 		default:
+			log.Println("Waiting for new files")
 			time.Sleep(5 * time.Second)
 		}
-
 	}
-	log.Println("Job generator stopped")
-}
-
-func resultsProc(results <-chan int, finished chan<- bool) {
-	log.Println("Waiting for results")
-	for r := range results {
-		log.Println("Result:", r)
-	}
-
-	log.Println("Results worker done")
-	finished <- true
-}
-
-func signalHandle(signals chan os.Signal, stop chan<- bool) {
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-
-	// wait for a signal
-	<-signals
-	log.Println()
-	log.Println("Got signal, sending all stop")
-	stop <- true
 }
 
 func main() {
-	jobs := make(chan int, 100)
-	results := make(chan int, 100)
-	signals := make(chan os.Signal, 1)
+	jobs := make(chan string, 100)
 	done := make(chan bool, 1)
-	stop := make(chan bool, 1)
-	jobsDone := make(chan bool, 3)
-	finished := make(chan bool, 1)
+
+	var workersDone sync.WaitGroup
 
 	// setup 3 workers
 	for w := 1; w <= 3; w++ {
-		go worker(w, jobs, results, jobsDone)
+		workersDone.Add(1)
+		go worker(w, jobs, &workersDone)
 	}
 
-	// read the results
-	go resultsProc(results, finished)
-
-	// start generating jobs
-	go jobGen(jobs, stop, done)
-
-	// wait for termination signal
-	go signalHandle(signals, stop)
+	// start watching the new directory
+	go jobGen(jobs, done)
 
 	// wait for the job generator to be done
 	<-done
 	close(jobs)
 
 	// wait for all the workers
-	for j := 1; j <= 3; j++ {
-		<-jobsDone
-	}
-	close(results)
-
-	// wait for the results to finish
-	<-finished
+	workersDone.Wait()
 }
